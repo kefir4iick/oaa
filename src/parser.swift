@@ -30,7 +30,11 @@ class Parser: ObservableObject {
             } else if upper.hasPrefix("INSERT INTO") {
                 results.append(insertInto(query))
             } else if upper.hasPrefix("SELECT") {
-                results.append(selectFrom(query))
+                if upper.contains("JOIN") && upper.contains("ON") {
+                    results.append(selectWithJoin(query))
+                } else {
+                    results.append(selectFrom(query))
+                }
             } else if upper.hasPrefix("DROP TABLE") {
                 results.append(dropTable(query))
             } else {
@@ -154,16 +158,21 @@ class Parser: ObservableObject {
             return "error in select: no from"
         }
 
+        let afterFrom = query[fromRange.upperBound...].trimmingCharacters(in: .whitespaces)
+        
+        var tableName = ""
+        var whereClause: String? = nil
+
+        if let whereRange = afterFrom.uppercased().range(of: "WHERE") {
+            tableName = afterFrom[..<whereRange.lowerBound].trimmingCharacters(in: .whitespaces)
+            whereClause = afterFrom[whereRange.upperBound...].trimmingCharacters(in: .whitespaces)
+        } else {
+            tableName = afterFrom.components(separatedBy: .whitespaces).first ?? ""
+        }
+
         let columnsPart = query[..<fromRange.lowerBound]
             .replacingOccurrences(of: "(?i)SELECT", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let tablePart = query[fromRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-        let tableName = tablePart.components(separatedBy: .whitespaces).first ?? ""
-
-        guard isValidIdentifier(tableName) else {
-            return "error in select: wrong name of table (\(tableName))"
-        }
+            .trimmingCharacters(in: .whitespaces)
 
         guard let table = database[tableName] else {
             return "error: table (\(tableName)) not exist"
@@ -177,15 +186,7 @@ class Parser: ObservableObject {
         if columnsPart == "*" {
             selectedColumns = table.columns
         } else {
-            selectedColumns = columnsPart
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-        }
-
-        for col in selectedColumns {
-            if !isValidIdentifier(col) {
-                return "error in select: wrong name of column (\(col))"
-            }
+            selectedColumns = columnsPart.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         }
 
         var colIndexes: [Int] = []
@@ -198,12 +199,22 @@ class Parser: ObservableObject {
         }
 
         var result = selectedColumns.joined(separator: " | ") + "\n"
+
         for row in table.rows {
+
+            if let cond = whereClause {
+                if !matchesWhere(values: row.values, columns: table.columns, condition: cond) {
+                    continue
+                }
+            }
+
             let filtered = colIndexes.map { row.values[$0] }
             result += filtered.joined(separator: " | ") + "\n"
         }
+
         return result
     }
+
 
     private func dropTable(_ query: String) -> String {
         let parts = query.components(separatedBy: .whitespaces)
@@ -221,4 +232,161 @@ class Parser: ObservableObject {
         database.removeValue(forKey: tableName)
         return "table (\(tableName)) deleted"
     }
+    
+    
+    
+    
+    private func selectWithJoin(_ query: String) -> String {
+        let upper = query.uppercased()
+
+        guard let fromRange = upper.range(of: "FROM") else {
+            return "error in select: no FROM"
+        }
+
+        let columnsPart = query[..<fromRange.lowerBound]
+            .replacingOccurrences(of: "(?i)SELECT", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+
+        let afterFrom = query[fromRange.upperBound...].trimmingCharacters(in: .whitespaces)
+        let afterFromUpper = afterFrom.uppercased()
+
+        var whereClause: String? = nil
+        var joinPart = afterFrom
+
+        if let whereRange = afterFromUpper.range(of: "WHERE") {
+            joinPart = afterFrom[..<whereRange.lowerBound].trimmingCharacters(in: .whitespaces)
+            whereClause = afterFrom[whereRange.upperBound...].trimmingCharacters(in: .whitespaces)
+        }
+
+        let joinUpper = joinPart.uppercased()
+
+        guard let joinRange = joinUpper.range(of: "JOIN"),
+              let onRange = joinUpper.range(of: "ON") else {
+            return "error in join: missing JOIN or ON"
+        }
+
+        let table1Name = joinPart[..<joinRange.lowerBound].trimmingCharacters(in: .whitespaces).components(separatedBy: .whitespaces)[0]
+        let table2Name = joinPart[joinRange.upperBound..<onRange.lowerBound].trimmingCharacters(in: .whitespaces).components(separatedBy: .whitespaces)[0]
+
+        let onCondition = joinPart[onRange.upperBound...].trimmingCharacters(in: .whitespaces)
+
+        guard let table1 = database[table1Name],
+              let table2 = database[table2Name] else {
+            return "error: one or both tables not exist"
+        }
+
+        let onParts = onCondition.components(separatedBy: "=").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard onParts.count == 2 else { return "error in join: invalid ON" }
+
+        func parseON(_ s: String) -> (String, String)? {
+            let p = s.components(separatedBy: ".")
+            return p.count == 2 ? (p[0], p[1]) : nil
+        }
+
+        guard
+            let (leftTable, leftColumn) = parseON(onParts[0]),
+            let (rightTable, rightColumn) = parseON(onParts[1])
+        else { return "error in join: invalid ON structure" }
+
+        guard
+            let leftIndex = database[leftTable]?.columns.firstIndex(of: leftColumn),
+            let rightIndex = database[rightTable]?.columns.firstIndex(of: rightColumn)
+        else { return "error in join: columns not found" }
+
+        var joinedRows: [[String]] = []
+
+        for r1 in table1.rows {
+            for r2 in table2.rows {
+                let leftValue = (leftTable == table1Name) ? r1.values[leftIndex] : r2.values[leftIndex]
+                let rightValue = (rightTable == table1Name) ? r1.values[rightIndex] : r2.values[rightIndex]
+
+                if leftValue == rightValue {
+                    joinedRows.append(r1.values + r2.values)
+                }
+            }
+        }
+
+        if joinedRows.isEmpty { return "no matching rows found" }
+
+        let fullColumns = table1.columns.map { "\(table1Name).\($0)" } +
+                          table2.columns.map { "\(table2Name).\($0)" }
+
+        let selectedColumns: [String] =
+            (columnsPart == "*")
+            ? fullColumns
+            : columnsPart.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+
+        let indexes = selectedColumns.compactMap { fullColumns.firstIndex(of: $0) }
+
+        if let cond = whereClause {
+            joinedRows = joinedRows.filter { row in
+                matchesWhere(values: row, columns: fullColumns, condition: cond)
+            }
+        }
+
+        if joinedRows.isEmpty { return "no rows after WHERE" }
+
+        var result = selectedColumns.joined(separator: " | ") + "\n"
+        for r in joinedRows {
+            let filtered = indexes.map { r[$0] }
+            result += filtered.joined(separator: " | ") + "\n"
+        }
+        return result
+    }
+
+
+
+    private func findColumnIndex(tableName: String, column: String) -> (table: Table, index: Int)? {
+        guard let table = database[tableName],
+              let index = table.columns.firstIndex(of: column) else {
+            return nil
+        }
+        return (table, index)
+    }
+    
+    
+    
+    private func matchesWhere(values: [String], columns: [String], condition: String) -> Bool {
+        let ops = ["<=", ">=", "=", ">", "<"]
+        var op: String?
+
+        for o in ops {
+            if condition.contains(o) {
+                op = o
+                break
+            }
+        }
+        guard let oper = op else { return false }
+
+        let parts = condition.components(separatedBy: oper)
+        guard parts.count == 2 else { return false }
+
+        let left = parts[0].trimmingCharacters(in: .whitespaces)
+        var right = parts[1].trimmingCharacters(in: .whitespaces)
+
+        if right.hasPrefix("\"") && right.hasSuffix("\"") {
+            right = String(right.dropFirst().dropLast())
+        }
+
+        guard let idx = columns.firstIndex(of: left) else { return false }
+        let value = values[idx]
+
+        if let vNum = Double(value), let rNum = Double(right) {
+            switch oper {
+            case ">": return vNum > rNum
+            case "<": return vNum < rNum
+            case "=": return vNum == rNum
+            case ">=": return vNum >= rNum
+            case "<=": return vNum <= rNum
+            default: return false
+            }
+        }
+
+        if oper == "=" {
+            return value == right
+        }
+
+        return false
+    }
+        
 }
